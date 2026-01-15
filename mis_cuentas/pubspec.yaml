@@ -44,6 +44,8 @@ dependencies:
   google_fonts: ^4.0.4
   path: ^1.9.1
   syncfusion_flutter_pdf: ^32.1.22
+  google_mlkit_text_recognition: ^0.15.0
+  pdfx: ^2.9.2
 
 dev_dependencies:
   flutter_test:

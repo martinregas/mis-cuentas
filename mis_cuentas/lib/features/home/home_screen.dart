@@ -1,10 +1,12 @@
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
+import 'package:file_picker/file_picker.dart';
+import 'dart:io';
 import '../../core/providers.dart';
 import '../../core/models/pdf_import.dart';
 import '../import_pdf/import_controller.dart';
+import '../import_pdf/debug_extract_screen.dart';
 import '../transactions/transaction_list_screen.dart';
 
 final importsProvider = FutureProvider<List<PdfImport>>((ref) async {
@@ -26,12 +28,36 @@ class HomeScreen extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('Mis Cuentas'),
         actions: [
-            IconButton(
-                icon: const Icon(Icons.list_alt),
-                onPressed: () {
-                    Navigator.push(context, MaterialPageRoute(builder: (_) => const TransactionListScreen()));
-                },
-            )
+          IconButton(
+            icon: const Icon(Icons.list_alt),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const TransactionListScreen(),
+                ),
+              );
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.bug_report),
+            onPressed: () async {
+              final result = await FilePicker.platform.pickFiles(
+                type: FileType.custom,
+                allowedExtensions: ['pdf'],
+              );
+              if (result != null && result.files.single.path != null) {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => DebugExtractScreen(
+                      file: File(result.files.single.path!),
+                    ),
+                  ),
+                );
+              }
+            },
+          ),
         ],
       ),
       body: Padding(
@@ -57,9 +83,14 @@ class HomeScreen extends ConsumerWidget {
                     itemBuilder: (context, index) {
                       final imp = imports[index];
                       return ListTile(
-                        leading: const Icon(Icons.picture_as_pdf, color: Colors.redAccent),
+                        leading: const Icon(
+                          Icons.picture_as_pdf,
+                          color: Colors.redAccent,
+                        ),
                         title: Text(imp.fileName),
-                        subtitle: Text(DateFormat.yMMMd().format(imp.importDate)),
+                        subtitle: Text(
+                          DateFormat.yMMMd().format(imp.importDate),
+                        ),
                       );
                     },
                   );
@@ -72,13 +103,18 @@ class HomeScreen extends ConsumerWidget {
         ),
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => ref.read(importControllerProvider.notifier).pickAndImportPdf(),
+        onPressed: () =>
+            ref.read(importControllerProvider.notifier).pickAndImportPdf(),
         child: const Icon(Icons.add),
       ),
     );
   }
 
-  Widget _buildImportCard(BuildContext context, WidgetRef ref, AsyncValue<void> state) {
+  Widget _buildImportCard(
+    BuildContext context,
+    WidgetRef ref,
+    AsyncValue<void> state,
+  ) {
     return Card(
       elevation: 4,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -86,11 +122,17 @@ class HomeScreen extends ConsumerWidget {
         padding: const EdgeInsets.all(24.0),
         child: Column(
           children: [
-            const Icon(Icons.cloud_upload_outlined, size: 48, color: Colors.white70),
+            const Icon(
+              Icons.cloud_upload_outlined,
+              size: 48,
+              color: Colors.white70,
+            ),
             const SizedBox(height: 16),
             Text(
               "Import Bank Statement",
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+              style: Theme.of(
+                context,
+              ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             const Text(
@@ -102,17 +144,47 @@ class HomeScreen extends ConsumerWidget {
             if (state.isLoading)
               const CircularProgressIndicator()
             else if (state.hasError)
-                 Text("Error: ${state.error}", style: const TextStyle(color: Colors.redAccent))
+              Text(
+                "Error: ${state.error}",
+                style: const TextStyle(color: Colors.redAccent),
+              )
             else
-              ElevatedButton.icon(
-                onPressed: () => ref.read(importControllerProvider.notifier).pickAndImportPdf(),
-                icon: const Icon(Icons.upload_file),
-                label: const Text("Select PDF"),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Theme.of(context).primaryColor,
-                  foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
-                ),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 16,
+                runSpacing: 12,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: () => ref
+                        .read(importControllerProvider.notifier)
+                        .pickAndImportPdf(),
+                    icon: const Icon(Icons.upload_file),
+                    label: const Text("Select PDFs"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Theme.of(context).primaryColor,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 12,
+                      ),
+                    ),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: () => ref
+                        .read(importControllerProvider.notifier)
+                        .pickAndImportFolder(),
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text("Select Folder"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[200],
+                      foregroundColor: Colors.black87,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 12,
+                      ),
+                    ),
+                  ),
+                ],
               ),
           ],
         ),

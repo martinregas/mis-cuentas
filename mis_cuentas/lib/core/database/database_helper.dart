@@ -1,4 +1,3 @@
-
 import 'package:sqflite/sqflite.dart' hide Transaction;
 import 'package:path/path.dart';
 import '../models/transaction.dart';
@@ -22,7 +21,7 @@ class DatabaseHelper {
     String path = join(await getDatabasesPath(), 'mis_cuentas.db');
     return await openDatabase(
       path,
-      version: 3, // Bump version
+      version: 4, // Force upgrade
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -42,7 +41,7 @@ class DatabaseHelper {
         period TEXT
       )
     ''');
-// ... existing cases table ...
+    // ... existing cases table ...
     await db.execute('''
       CREATE TABLE cases(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +52,7 @@ class DatabaseHelper {
         FOREIGN KEY(transactionId) REFERENCES transactions(id) ON DELETE CASCADE
       )
     ''');
-    
+
     await db.execute('''
       CREATE TABLE imports(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +73,14 @@ class DatabaseHelper {
       // Migration for Period
       await db.execute('ALTER TABLE transactions ADD COLUMN period TEXT');
     }
+    if (oldVersion < 4) {
+      // Re-run Period migration just in case it failed or user was on weird state
+      try {
+        await db.execute('ALTER TABLE transactions ADD COLUMN period TEXT');
+      } catch (e) {
+        print("Migration: Column 'period' likely already exists. Error: $e");
+      }
+    }
   }
 
   // Transactions
@@ -84,13 +91,16 @@ class DatabaseHelper {
 
   Future<List<Transaction>> getTransactions() async {
     Database db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('transactions', orderBy: "date DESC");
+    final List<Map<String, dynamic>> maps = await db.query(
+      'transactions',
+      orderBy: "date DESC",
+    );
     return List.generate(maps.length, (i) => Transaction.fromMap(maps[i]));
   }
-  
+
   Future<void> deleteAllTransactions() async {
-     Database db = await database;
-     await db.delete('transactions');
+    Database db = await database;
+    await db.delete('transactions');
   }
 
   // Cases
@@ -115,9 +125,9 @@ class DatabaseHelper {
     );
   }
 
-   Future<void> deleteAllCases() async {
-     Database db = await database;
-     await db.delete('cases');
+  Future<void> deleteAllCases() async {
+    Database db = await database;
+    await db.delete('cases');
   }
 
   // Imports
@@ -125,10 +135,13 @@ class DatabaseHelper {
     Database db = await database;
     return await db.insert('imports', pdfImport.toMap());
   }
-  
+
   Future<List<PdfImport>> getImports() async {
     Database db = await database;
-    final List<Map<String, dynamic>> maps = await db.query('imports', orderBy: "importDate DESC");
+    final List<Map<String, dynamic>> maps = await db.query(
+      'imports',
+      orderBy: "importDate DESC",
+    );
     return List.generate(maps.length, (i) => PdfImport.fromMap(maps[i]));
   }
 
@@ -137,7 +150,7 @@ class DatabaseHelper {
     Database db = await database;
     // Get distinct periods, including NULL
     final List<Map<String, dynamic>> maps = await db.rawQuery(
-      'SELECT DISTINCT period FROM transactions ORDER BY period DESC'
+      'SELECT DISTINCT period FROM transactions ORDER BY period DESC',
     );
     return List.generate(maps.length, (i) => maps[i]['period'] as String?);
   }

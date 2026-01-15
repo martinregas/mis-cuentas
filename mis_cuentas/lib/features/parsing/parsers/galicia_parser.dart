@@ -1,342 +1,355 @@
 import 'package:mis_cuentas/core/models/transaction.dart';
-import 'package:mis_cuentas/core/utils/text_normalization.dart';
-import 'package:mis_cuentas/features/parsing/statement_parser.dart';
-import 'package:mis_cuentas/core/utils/extensions.dart';
+import '../../../core/utils/text_normalization.dart';
+import '../statement_parser.dart';
 
 class GaliciaParser implements StatementParser {
-  // Date: dd-mm-yy or dd-MMM-yy (e.g. 01-12-25 or 20-Nov-25)
-  static final RegExp _dateRegex = RegExp(r'^(\d{1,2}[/\-\.](?:\d{1,2}|[a-zA-Z]{3})[/\-\.]\d{2,4})$');
-  
-  // Quota: 01/12 or 12/12 format (Strict)
-  static final RegExp _quotaRegex = RegExp(r'^\d{1,2}/\d{1,2}$');
+  // Regex to match: "13-10-25" ... "46.500,00"
+  // ^\s*(\d{2}-\d{2}-\d{2})\s+(.+?)\s+(-?[\d\.]*,\d{2})\s*$
+  // RELAXED regex to handle "Glued" text (e.g. "04-10-25* GUARAPO")
+  // \s* instead of \s+ allowed after date
+  // 1. Standard: "Date Desc Amount" (Single Line)
+  // RELAXED regex to handle "Glued" text (e.g. "04-10-25* GUARAPO")
+  static final RegExp _transactionLineRegex = RegExp(
+    r'^\s*(\d{2}-\d{2}-\d{2})\s*(.+?)\s+(-?[\d\.]*,\d{2})\s*$',
+  );
 
-  // Receipt: Usually 6+ digits strictly numeric, e.g. 004073.
-  // We use this to distinguish from "Branch 215" in description.
-  static final RegExp _receiptRegex = RegExp(r'^\d{6,}$');
+  // 2. Partial: "Date Desc" (Missing Amount)
+  // Used for multi-line transactions (e.g. GUARAPO)
+  static final RegExp _partialLineRegex = RegExp(
+    r'^\s*(\d{2}-\d{2}-\d{2})\s*(.+)$',
+  );
 
-  // Amount: Must have punctuation if it's not a generic integer. 
-  // But strictly, PDF amounts usually have 2 decimal places: "100,00", "5.865,00"
-  // We'll require at least one dot or comma to be considered a valid amount candidate,
-  // to differentiate from integers in description.
-  static final RegExp _amountRegex = RegExp(r'^-?[\d\.,]+$');
-  
-  // Blacklist words to ignore (Payments, Balance, etc.)
-  static const List<String> _blacklist = [
-    'SU PAGO EN', 'SALDO ANTERIOR', 'TOTAL A PAGAR', 'PAGO MINIMO', 
-    'DEBITO AUTOMATICO', 'IMPUESTO SELLOS', 'IVA RG', 'PERCEP', 'IMP PAIS', 'DB.RG'
-    // Note: User might want to see Taxes (IVA/DB.RG)? 
-    // User complaint was "Faltan un monton de gastos".
-    // "IVA RG", "DB.RG" were visible in the screenshot, user didn't explicitly complain about them appearing,
-    // explicitly complained about "SU PAGO EN PESOS".
-    // I will filter "SU PAGO" and "SALDO". 
-    // I will optionally filter Taxes if they are clutter, but for now let's keep taxes as they are technically expenses.
+  // 3. Amount Only: "14.333,33" or "1.000,00"
+  static final RegExp _amountOnlyRegex = RegExp(r'^\s*(-?[\d\.]*,\d{2})\s*$');
+
+  final List<String> _blacklist = [
+    'SALDO ANTERIOR',
+    'SU PAGO EN PESOS',
+    'SU PAGO EN DOLARES',
+    'SU PAGO EN USD', // Common variant
+    'TOTAL A PAGAR',
+    'PAGO DE SERVICIOS',
+    'DEBITO AUTOMATICO',
   ];
+
+  String currentCurrency = 'ARS'; // Default to Pesos
 
   @override
   bool canParse(String fullText) {
-    return fullText.toLowerCase().contains('galicia');
+    String upper = fullText.toUpperCase();
+    return upper.contains('GALICIA') || upper.contains('30-50000173-5');
   }
 
   @override
   List<Transaction> parse(String text, String pdfName, int? pageNumber) {
     List<Transaction> transactions = [];
     List<String> lines = text.split('\n');
+    currentCurrency = 'ARS'; // Reset state per file
 
-    print("DEBUG: GaliciaParser (Strict) starting on ${lines.length} lines.");
-    
-    // Skip everything until we find the SECOND "FECHA" header
-    // (First one is in CONSOLIDADO, second one is in DETALLE DEL CONSUMO)
-    bool foundDetailSection = false;
-    int fechaCount = 0;
+    // 1. Attempt to find "Statement Date" (Cierre) to determine the Period
+    DateTime? statementDate = _extractStatementDateFromText(lines);
+    String? period; // YYYY-MM
 
-    for (String line in lines) {
-      line = line.trim();
-      if (line.isEmpty) continue;
-      
-      // Check if we've reached the detail section
-      if (!foundDetailSection) {
-        String upperLine = line.toUpperCase();
-        // Look for the header line with column names
-        if (upperLine.contains('FECHA') && upperLine.contains('COMPROBANTE')) {
-          fechaCount++;
-          if (fechaCount == 2) {
-            // This is the second FECHA header (DETALLE DEL CONSUMO section)
-            foundDetailSection = true;
-            print("DEBUG: Found second 'FECHA' header (DETALLE DEL CONSUMO), starting to parse transactions.");
-          }
-        }
-        continue; // Skip all lines until we find the second header
-      }
-
-      // 1. Aggressive Token Spacing
-      // Visually they look separated, but raw extraction might be merging them if columns are tight.
-      // This regex forces a space between:
-      // - Any Digit group
-      // - FOLLOWED BY a Hyphen or Number
-      // - That looks like an amount (contains comma/dot)
-      // Example: "003347-6.816,18" -> "003347 -6.816,18"
-      // Example: "00334710.000,00" -> "003347 10.000,00" (Risk of breaking large numbers? Unlikely for Receipt vs Amount)
-      
-      // Fix Negative Stuck: 003347-6.816
-      line = line.replaceAllMapped(
-          RegExp(r'(\d+)(-\d+[.,]\d+)'), 
-          (Match m) => "${m.group(1)} ${m.group(2)}"
+    if (statementDate != null) {
+      print("DEBUG: Found Statement Date: $statementDate");
+      period =
+          "${statementDate.year}-${statementDate.month.toString().padLeft(2, '0')}";
+    } else {
+      print(
+        "DEBUG: Could not find Statement Date. Will infer from transactions.",
       );
-      
-      // Fix Positive Stuck: 00334711.399,00
-      // If we see >3 digits followed by something starting with digit and containing dot/comma?
-      // Safer: (\d{4,}) (\d+[.,]\d+)
-      line = line.replaceAllMapped(
-          RegExp(r'(\d{4,})(\d{1,3}[.,]\d+)'), 
-          (Match m) => "${m.group(1)} ${m.group(2)}"
-      );
-
-      // Check for Date at start
-      List<String> tokens = line.split(RegExp(r'\s+'));
-      if (tokens.isEmpty) continue;
-      
-      if (!_dateRegex.hasMatch(tokens[0])) {
-        // Not a transaction line (Header, Footer, etc.)
-        // Debug: Print first few rejected lines to see if we are missing legit ones
-        if (tokens[0].length > 5 && RegExp(r'\d').hasMatch(tokens[0])) {
-           print("DEBUG: Rejected Line (Date mismatch): $line [Token0: '${tokens[0]}']");
-        }
-        continue;
-      }
-      
-      // Check blacklist
-      String fullLineUpper = line.toUpperCase();
-      if (fullLineUpper.contains('SU PAGO EN') || fullLineUpper.contains('SALDO ANTERIOR')) {
-         print("DEBUG: Ignoring Payment/Balance line: $line");
-         continue; 
-      }
-
-      // 2. Strict Column Parsing
-      // Expected Structure:
-      // [Date] [Description Words...] [Quota?] [Receipt?] [Amount1?] [Amount2?]
-      
-      // 2. Strict Column Parsing
-      // Expected Structure:
-      // [Date] [Description Words...] [Quota?] [Receipt?] [Amount1?] [Amount2?]
-      
-      DateTime? date = _parseDate(tokens[0]);
-      if (date == null) {
-        // print("DEBUG: First token not a date: ${tokens[0]}");
-        continue;
-      }
-
-      // Scan from RIGHT to find Amounts and Metadata
-      List<String> trailingColumns = [];
-      int cursor = tokens.length - 1;
-      
-      // Debug this line
-      print("DEBUG: Processing Line: $line");
-      print("DEBUG: Tokens: $tokens");
-      
-      while (cursor > 0) {
-        String t = tokens[cursor];
-        
-        bool isQuota = _quotaRegex.hasMatch(t);
-        bool isReceipt = _receiptRegex.hasMatch(t);
-        bool isAmount = _isStrictAmount(t); 
-        
-        // Debug classification
-        // print("DEBUG: Token '$t' -> Quota:$isQuota Receipt:$isReceipt Amount:$isAmount");
-        
-        if (isQuota || isReceipt || isAmount) {
-           trailingColumns.insert(0, t); 
-        } else {
-           // Break on Description
-           break;
-        }
-        cursor--;
-      }
-      
-      print("DEBUG: Trailing Columns Identified: $trailingColumns");
-      
-      if (trailingColumns.isEmpty) {
-        print("DEBUG: Skipped line (No trailing columns found)");
-        continue;
-      }
-      
-      List<double> amountsFound = [];
-      for (var col in trailingColumns) {
-         // Now we accept almost anything as amount if it passed the _isStrictAmount check (which is now loose)
-         // BUT we must filter out Receipts/Quotas from being treated as amounts here.
-         if (!_quotaRegex.hasMatch(col) && !_receiptRegex.hasMatch(col)) {
-             try {
-               amountsFound.add(TextNormalization.parseAmount(col));
-             } catch(e) {
-               print("DEBUG: Failed to parse amount '${col}'");
-             }
-         }
-      }
-      
-      print("DEBUG: Amounts extracted: $amountsFound");
-
-      if (amountsFound.isEmpty) {
-         print("DEBUG: Skipped line (No valid amounts parsed)");
-         continue;
-      }
-      
-      // Logic for ARS vs USD
-      double finalAmount = 0.0;
-      String currency = 'ARS';
-
-      if (amountsFound.length == 2) {
-         // [Pesos, Dollars] assuming second is USD
-         double ars = amountsFound[0];
-         double usd = amountsFound[1];
-         // Logic: if both exist, prioritize USD? Or check logic.
-         // Let's assume the last one is USD.
-         finalAmount = usd;
-         currency = 'USD'; 
-      } else {
-         // 1 Amount found.
-         finalAmount = amountsFound[0];
-         currency = 'ARS'; 
-         // Can we detect USD by regex in description? "USD" keyword?
-         String fullLine = tokens.join(' ');
-         if (fullLine.contains('USD')) {
-            currency = 'USD';
-         }
-      }
-
-      // Extract Description
-      // From index 1 to cursor (inclusive)
-      if (cursor < 1) {
-         // Weird case: tokens[0] is date, cursor is 0? Means immediate amount?
-         // "01-12-25 500,00" -> No description.
-         print("DEBUG: Line with no description: $line");
-         continue; 
-      }
-      
-      String descRaw = tokens.sublist(1, cursor + 1).join(' ');
-      String merchant = TextNormalization.normalizeMerchant(descRaw);
-
-      transactions.add(Transaction(
-        date: date,
-        descriptionRaw: descRaw,
-        merchantNorm: merchant,
-        amount: finalAmount,
-        currency: currency,
-        pdfName: pdfName,
-        pageNumber: pageNumber,
-      ));
     }
 
+    print("DEBUG: Galicia Regex Parser processing ${lines.length} lines.");
+
+    for (int i = 0; i < lines.length; i++) {
+      String line = lines[i];
+      if (line.trim().isEmpty) continue;
+
+      // 1. Normalize line for Header Detection (remove multiple spaces)
+      String upper = line.toUpperCase().replaceAll(RegExp(r'\s+'), ' ');
+
+      // 2. Currency Section Detection
+      if (upper.contains('CONSUMOS EN DOLARES') ||
+          upper.contains('CONSUMOS EN DÓLARES') ||
+          upper.contains('CONSUMOS EN U\$S')) {
+        currentCurrency = 'USD';
+        continue;
+      }
+      if (upper.contains('CONSUMOS EN PESOS') ||
+          upper.contains('DETALLE DE LOS CONSUMOS')) {
+        currentCurrency = 'ARS';
+        continue;
+      }
+
+      // 3. Try Standard Match (Single Line)
+      var match = _transactionLineRegex.firstMatch(line);
+      if (match != null) {
+        _addTransaction(
+          transactions,
+          match.group(1)!,
+          match.group(2)!,
+          match.group(3)!,
+          currentCurrency,
+          pdfName,
+          pageNumber,
+          period, // Pass period
+        );
+        continue;
+      }
+
+      // 4. Try Partial Match (Date + Desc only) -> Check next lines for Amount
+      var partialMatch = _partialLineRegex.firstMatch(line);
+      if (partialMatch != null) {
+        String dateStr = partialMatch.group(1)!;
+        String descRaw = partialMatch.group(2)!;
+
+        String? foundAmountStr;
+
+        // Peek Line + 1
+        if (i + 1 < lines.length) {
+          var nextLine = lines[i + 1];
+          var amountMatch = _amountOnlyRegex.firstMatch(nextLine);
+          if (amountMatch != null) {
+            foundAmountStr = amountMatch.group(1);
+            i += 1; // Consume next line
+          } else {
+            // Peek Line + 2 (sometimes there is an ID in between)
+            if (i + 2 < lines.length) {
+              var secondLine = lines[i + 2];
+              var amountMatch2 = _amountOnlyRegex.firstMatch(secondLine);
+              if (amountMatch2 != null) {
+                foundAmountStr = amountMatch2.group(1);
+                i += 2; // Consume next 2 lines
+                // descRaw += " " + nextLine.trim(); // Optional: merge ID
+              }
+            }
+          }
+        }
+
+        if (foundAmountStr != null) {
+          print(
+            "DEBUG: Found Multi-line Transaction: $descRaw -> $foundAmountStr",
+          );
+          _addTransaction(
+            transactions,
+            dateStr,
+            descRaw,
+            foundAmountStr,
+            currentCurrency,
+            pdfName,
+            pageNumber,
+            period, // Pass period
+          );
+          continue;
+        }
+      }
+    } // Close parsing loop
+
+    // Failsafe: If StatementDate (header) failed, infer from the LATEST transaction date.
+    // This ensures we group everything under one month (e.g. Dec-25) instead of splitting (Nov/Dec).
+    if (period == null && transactions.isNotEmpty) {
+      DateTime maxDate = transactions.first.date;
+      for (var t in transactions) {
+        if (t.date.isAfter(maxDate)) maxDate = t.date;
+      }
+      period = "${maxDate.year}-${maxDate.month.toString().padLeft(2, '0')}";
+      print(
+        "DEBUG: Statement Date not found. Inferred Period from Max Transaction Date: $period",
+      );
+
+      // Update all transactions in the list with this new period
+      for (int i = 0; i < transactions.length; i++) {
+        // Create copy with new period (since fields are final)
+        transactions[i] = Transaction(
+          id: transactions[i].id,
+          date: transactions[i].date,
+          descriptionRaw: transactions[i].descriptionRaw,
+          merchantNorm: transactions[i].merchantNorm,
+          amount: transactions[i].amount,
+          currency: transactions[i].currency,
+          pdfName: transactions[i].pdfName,
+          pageNumber: transactions[i].pageNumber,
+          period: period,
+        );
+      }
+    }
+
+    print(
+      "DEBUG: Galicia Regex Parser found ${transactions.length} transactions. Final Period: $period",
+    );
     return transactions;
   }
 
-  bool _isStrictAmount(String t) {
-     // Must match basic regex (allow negatives)
-     if (!_amountRegex.hasMatch(t)) return false;
-     
-     // CRITICAL: Must have punctuation (text-to-double logic handles 1.000 and 1,00)
-     // To avoid capturing ID "004073" or "215", we require a separator.
-     // Exception: "100" or "5000" (Round numbers).
-     // Bank statements usually format with ",00".
-     // "100,00" -> has comma.
-     // "34,47" -> has comma.
-     // "1.760.261,58" -> has dots and comma.
-     // "215" (Branch) -> No separator.
-     // "004073" (Receipt) -> No separator.
-     
-     return true;
-     /*
-     // Original Strict Check: Required punctuation.
-     // This was too strict for amounts like "100" or "5000".
-     // return t.contains('.') || t.contains(',');
-     */
+  void _addTransaction(
+    List<Transaction> list,
+    String dateStr,
+    String desc,
+    String amountStr,
+    String currency,
+    String pdfName,
+    int? pageNumber,
+    String? forcedPeriod,
+  ) {
+    if (_isBlacklisted(desc)) return;
+
+    String cleanAmount = amountStr.replaceAll('.', '').replaceAll(',', '.');
+    double amount;
+    try {
+      amount = double.parse(cleanAmount);
+    } catch (e) {
+      return;
+    }
+
+    DateTime? date = _parseDate(dateStr);
+    if (date == null) return;
+
+    // Force USD logic
+    String upperDesc = desc.toUpperCase();
+    String finalCurrency = currency;
+    if (upperDesc.contains('USD') || upperDesc.contains('U\$S')) {
+      finalCurrency = 'USD';
+    }
+
+    // Determine Period: Use Forced if available, else derive from date
+    String finalPeriod =
+        forcedPeriod ?? "${date.year}-${date.month.toString().padLeft(2, '0')}";
+
+    list.add(
+      Transaction(
+        date: date,
+        descriptionRaw: desc.trim(),
+        merchantNorm: TextNormalization.normalizeMerchant(desc),
+        amount: amount,
+        currency: finalCurrency,
+        pdfName: pdfName,
+        pageNumber: pageNumber,
+        period: finalPeriod,
+      ),
+    );
+  }
+
+  bool _isBlacklisted(String description) {
+    String upper = description.toUpperCase().replaceAll(RegExp(r'\s+'), ' ');
+    for (var b in _blacklist) {
+      if (upper.contains(b)) return true;
+    }
+    return false;
   }
 
   DateTime? _parseDate(String dateStr) {
     try {
-      dateStr = dateStr.replaceAll('-', '/').replaceAll('.', '/');
-      List<String> parts = dateStr.split('/');
-      if (parts.length < 2) return null;
-
+      var parts = dateStr.split('-');
+      if (parts.length != 3) return null;
       int day = int.parse(parts[0]);
-      int month = _monthReview(parts[1]);
-      int year = DateTime.now().year;
-
-      if (parts.length > 2) {
-        int y = int.tryParse(parts[2]) ?? 0;
-        if (y < 100) year = 2000 + y;
-        else year = y;
-      }
+      int month = int.parse(parts[1]);
+      int year = int.parse(parts[2]) + 2000;
       return DateTime(year, month, day);
     } catch (e) {
       return null;
     }
   }
 
-  int _monthReview(String monthStr) {
-    if (RegExp(r'^\d+$').hasMatch(monthStr)) return int.parse(monthStr);
-    
-    String m = monthStr.toLowerCase();
-    const months = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic',
-                    'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-    
-    for (int i=0; i<months.length; i++) {
-      if (m.startsWith(months[i])) return (i % 12) + 1;
-    }
-    return 1;
-  }
-  
-  @override
-  DateTime? extractStatementDate(String fullText) {
-    // Strategy 1: Look for "Cierre actual" in the ENTIRE text
-    // The previous 1000 char limit might have been too aggressive.
-    
-    // Normalize newlines to spaces for easier regex
-    String text = fullText.replaceAll('\n', ' ');
-    
-    // 1. Find anchor "Cierre actual" or "Cierre"
-    int anchorIndex = text.toLowerCase().indexOf('cierre actual');
-    if (anchorIndex == -1) {
-       anchorIndex = text.toLowerCase().indexOf('cierre');
-    }
+  DateTime? _extractStatementDateFromText(List<String> lines) {
+    int limit = lines.length < 100 ? lines.length : 100;
 
-    if (anchorIndex != -1) {
-      // Find extraction near anchor
-      final dateRegex = RegExp(r'(\d{1,2}[/\-\.](?:\d{1,2}|[a-zA-Z]{3,4})[/\-\.]\d{2,4})');
-      final matches = dateRegex.allMatches(text);
+    RegExp dateReg = RegExp(r"(\d{2}-\w{3}-\d{2})"); // 24-Dic-25
+    RegExp dateRegNum = RegExp(r"(\d{2}/\d{2}/\d{2})"); // 24/12/25
+    RegExp dateRegDash = RegExp(r"(\d{2}-\d{2}-\d{2})"); // 24-12-25
 
-      Match? bestMatch;
-      int minDistance = 999999;
+    // Specific Regex for the "Timeline" line seen in logs: "20-Nov-25 01-Dic-25 24-Dic-25"
+    // We want the 3rd date (Cierre Actual)
+    RegExp threeDatesReg = RegExp(
+      r"(\d{2}-\w{3}-\d{2})\s+(\d{2}-\w{3}-\d{2})\s+(\d{2}-\w{3}-\d{2})",
+    );
 
-      for (var m in matches) {
-         int dist = (m.start - anchorIndex).abs();
-         if (dist < minDistance && dist < 500) { // Limit distance to be relevant
-           minDistance = dist;
-           bestMatch = m;
-         }
+    for (int i = 0; i < limit; i++) {
+      String line = lines[i];
+      String upper = line.toUpperCase();
+
+      // 1. Check for the Triple Date Line (Timeline)
+      var tripleMatch = threeDatesReg.firstMatch(line);
+      if (tripleMatch != null) {
+        // Group 3 is Cierre Actual
+        print(
+          "DEBUG: Found Triple Date Line. extracting Cierre Actual: ${tripleMatch.group(3)}",
+        );
+        return _parseHeaderDate(tripleMatch.group(3)!);
       }
 
-      if (bestMatch != null) {
-        String dateStr = bestMatch.group(1)!;
-        print("DEBUG: Found Date via 'Cierre' Strategy: $dateStr");
-        return _parseDate(dateStr);
+      // 2. Check for explicit labels
+      if (upper.contains("CIERRE ACTUAL") ||
+          upper.contains("CIERRE") ||
+          upper.contains("VTO.") ||
+          upper.contains("VENCIMIENTO")) {
+        var match =
+            dateReg.firstMatch(line) ??
+            dateRegNum.firstMatch(line) ??
+            dateRegDash.firstMatch(line);
+        if (match != null) {
+          return _parseHeaderDate(match.group(1)!);
+        }
+        if (i + 1 < lines.length) {
+          String nextLine = lines[i + 1];
+          var matchNext =
+              dateReg.firstMatch(nextLine) ??
+              dateRegNum.firstMatch(nextLine) ??
+              dateRegDash.firstMatch(nextLine);
+          if (matchNext != null) return _parseHeaderDate(matchNext.group(1)!);
+        }
       }
     }
-
-    // Strategy 2 (Backup): Look for "SU PAGO EN PESOS" or "SU PAGO EN USD"
-    // Format: "06-10-25 SU PAGO EN PESOS ..."
-    // The date is typically at the start of the line or just before the text.
-    
-    final paymentRegex = RegExp(r'(\d{2}-\d{2}-\d{2})\s+SU\s+PAGO\s+EN\s+(PESOS|USD)', caseSensitive: false);
-    final paymentMatch = paymentRegex.firstMatch(text);
-    
-    if (paymentMatch != null) {
-      String dateStr = paymentMatch.group(1)!;
-      print("DEBUG: Found Date via 'PAGO' Strategy: $dateStr");
-      return _parseDate(dateStr);
-    }
-    
-    print("DEBUG: Could not extract Statement Date (strategies exhausted).");
     return null;
   }
+
+  DateTime? _parseHeaderDate(String dateStr) {
+    try {
+      String clean = dateStr.replaceAll('/', '-');
+      // Fix potential spacing issues "24 -Dic- 25" ? Unlikely with the regex.
+
+      if (RegExp(r'[a-zA-Z]').hasMatch(clean)) {
+        const months = {
+          'ENE': '01',
+          'FEB': '02',
+          'MAR': '03',
+          'ABR': '04',
+          'MAY': '05',
+          'JUN': '06',
+          'JUL': '07',
+          'AGO': '08',
+          'SEP': '09',
+          'OCT': '10',
+          'NOV': '11',
+          'DIC': '12',
+        };
+        // Handle "24-Dic-25" case-insensitively
+        String upper = clean.toUpperCase();
+        for (var entry in months.entries) {
+          if (upper.contains(entry.key)) {
+            String keyPart = "";
+            // Find the exact substring to replace to preserve existing format structure if needed,
+            // but simpler to just split.
+            var parts = clean.split('-');
+            if (parts.length == 3) {
+              clean = "${parts[0]}-${entry.value}-${parts[2]}";
+            }
+            break;
+          }
+        }
+      }
+      var parts = clean.split('-');
+      int day = int.parse(parts[0]);
+      int month = int.parse(parts[1]);
+      int year = int.parse(parts[2]) + 2000;
+      return DateTime(year, month, day);
+    } catch (e) {
+      print("DEBUG: Failed to parse header date: $dateStr -> $e");
+      return null;
+    }
+  }
+
+  @override
+  DateTime? extractStatementDate(String text) {
+    return _extractStatementDateFromText(text.split('\n'));
+  }
 }
-
-
